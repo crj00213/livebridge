@@ -57,6 +57,15 @@ object LiveUpdateNotifier {
     private const val LOCKSCREEN_CONTENT_HIDDEN_TEXT = "Content hidden"
 
     private val OTP_CODE_LENGTH = 4..8
+    private const val MONEY_CONTEXT_BEFORE = 8
+    private const val MONEY_CONTEXT_AFTER = 4
+    private val MONEY_CONTEXT_BREAKS = charArrayOf('，', ',', '。', '；', ';', '！', '!', '\n')
+    private val moneyDecimalTailPattern = Regex("""^[.,]\d{1,2}""")
+    private val otpDashPrefixPattern =
+        Regex("""(?<![A-Za-z])([A-Za-z]{1,8})-[『「【\[(（]?\s*$""")
+    private val otpIdentifierPrefixPattern = Regex(
+        """(?:識別碼|识别码|辨識碼|辨识码)\s*[:：]?\s*(?=[A-Za-z0-9]*[A-Za-z])([A-Za-z0-9]{2,8})"""
+    )
     private val NATIVE_IN_CALL_PACKAGES = setOf(
         "com.samsung.android.incallui",
         "com.samsung.android.dialer",
@@ -1822,7 +1831,10 @@ object LiveUpdateNotifier {
         } else {
             null
         }
-        val otpPresentationText = otpShortTextOverride ?: otpOverride?.code
+        val otpDisplayText = otpOverride?.let { match ->
+            match.prefix?.let { prefix -> "$prefix-${match.code}" } ?: match.code
+        }
+        val otpPresentationText = otpShortTextOverride ?: otpDisplayText
         val contentTitle = otpPresentationText ?: displayTitle
         val contentText = if (otpOverride != null) {
             appName
@@ -2004,7 +2016,7 @@ object LiveUpdateNotifier {
             )
             builder.setShortCriticalText(
                 limitIslandText(
-                    otpPresentationText ?: otpOverride.code,
+                    otpPresentationText ?: otpDisplayText ?: otpOverride.code,
                     aospCuttingEnabled,
                     aospCuttingLength
                 )
@@ -2042,7 +2054,7 @@ object LiveUpdateNotifier {
                 null
             }
             val hyperTicker = when {
-                otpOverride != null -> otpPresentationText ?: otpOverride.code
+                otpOverride != null -> otpPresentationText ?: otpDisplayText ?: otpOverride.code
                 callChronometerStart != null ->
                     formatMillisecondsAsClock(System.currentTimeMillis() - callChronometerStart)
                 mediaTicker != null -> mediaTicker
@@ -2501,16 +2513,33 @@ object LiveUpdateNotifier {
                 if (digits.length !in OTP_CODE_LENGTH) {
                     continue
                 }
-                if (!hasOtpTokenBoundaries(combinedText, valueRange.first, valueRange.last + 1)) {
+                val firstDigitOffset = rawValue.indexOfFirst(Char::isDigit)
+                val lastDigitOffset = rawValue.indexOfLast(Char::isDigit)
+                val rawMatchesRange = rawValue.length == valueRange.last - valueRange.first + 1 &&
+                        firstDigitOffset >= 0
+                val digitStart = if (rawMatchesRange) {
+                    valueRange.first + firstDigitOffset
+                } else {
+                    valueRange.first
+                }
+                val digitEnd = if (rawMatchesRange) {
+                    valueRange.first + lastDigitOffset + 1
+                } else {
+                    valueRange.last + 1
+                }
+                if (!hasOtpTokenBoundaries(combinedText, digitStart, digitEnd)) {
                     continue
                 }
                 if (isLikelyMoneyCandidate(
                         combinedLower,
-                        valueRange.first,
-                        valueRange.last + 1,
+                        digitStart,
+                        digitEnd,
                         parserDictionary
                     )
                 ) {
+                    continue
+                }
+                if (isPartOfLongDigitRun(combinedText, digitStart, digitEnd)) {
                     continue
                 }
                 if (looksLikeOrderContextAroundMatch(
@@ -2548,10 +2577,49 @@ object LiveUpdateNotifier {
                 .thenBy { -it.start }
         ) ?: return null
 
+        val codeStart = combinedText.indexOf(selected.code, selected.start)
+            .takeIf { it >= 0 } ?: selected.start
         return OtpMatch(
             code = selected.code,
-            aggregateKey = otpAggregateKeyForCode(packageName, selected.code)
+            aggregateKey = otpAggregateKeyForCode(packageName, selected.code),
+            prefix = findOtpPrefix(combinedText, codeStart)
         )
+    }
+
+    private fun findOtpPrefix(text: String, codeStart: Int): String? {
+        val before = text.substring((codeStart - 12).coerceAtLeast(0), codeStart)
+        otpDashPrefixPattern.find(before)?.let {
+            return it.groupValues[1].uppercase(Locale.ROOT)
+        }
+        return otpIdentifierPrefixPattern.find(text)
+            ?.groupValues
+            ?.get(1)
+            ?.uppercase(Locale.ROOT)
+    }
+
+    private fun isPartOfLongDigitRun(text: String, start: Int, endExclusive: Int): Boolean {
+        fun isSeparator(ch: Char) = ch == ' ' || ch == '-'
+        var left = start
+        while (left >= 2 && isSeparator(text[left - 1]) && text[left - 2].isDigit()) {
+            left -= 2
+            while (left > 0 && text[left - 1].isDigit()) {
+                left--
+            }
+        }
+        var right = endExclusive
+        while (right + 1 < text.length && isSeparator(text[right]) && text[right + 1].isDigit()) {
+            right += 2
+            while (right < text.length && text[right].isDigit()) {
+                right++
+            }
+        }
+        var digitCount = 0
+        for (index in left until right) {
+            if (text[index].isDigit()) {
+                digitCount++
+            }
+        }
+        return digitCount > OTP_CODE_LENGTH.last
     }
 
     private fun collectOtpTriggerRanges(
@@ -2638,9 +2706,26 @@ object LiveUpdateNotifier {
     ): Boolean {
         val left = if (start > 0) text[start - 1] else null
         val right = if (endExclusive < text.length) text[endExclusive] else null
-        val leftOk = left == null || !left.isLetterOrDigit()
-        val rightOk = right == null || !right.isLetterOrDigit()
+        val leftOk = left == null || !isOtpTokenChar(left)
+        val rightOk = right == null || !isOtpTokenChar(right)
         return leftOk && rightOk
+    }
+
+    private fun isOtpTokenChar(ch: Char): Boolean {
+        if (!ch.isLetterOrDigit()) {
+            return false
+        }
+        return !isCjkChar(ch)
+    }
+
+    private fun isCjkChar(ch: Char): Boolean {
+        val code = ch.code
+        return code in 0x3040..0x30FF ||
+                code in 0x3400..0x4DBF ||
+                code in 0x4E00..0x9FFF ||
+                code in 0xF900..0xFAFF ||
+                code in 0x1100..0x11FF ||
+                code in 0xAC00..0xD7AF
     }
 
     private fun extractEntityToken(combinedText: String, parserDictionary: LiveParserDictionary): String {
@@ -3122,8 +3207,22 @@ object LiveUpdateNotifier {
         endExclusive: Int,
         parserDictionary: LiveParserDictionary
     ): Boolean {
-        val windowStart = (start - 18).coerceAtLeast(0)
-        val windowEnd = (endExclusive + 18).coerceAtMost(textLower.length)
+        var windowStart = (start - MONEY_CONTEXT_BEFORE).coerceAtLeast(0)
+        val lastBreak = textLower.lastIndexOfAny(MONEY_CONTEXT_BREAKS, start - 1)
+        if (lastBreak >= windowStart) {
+            windowStart = lastBreak + 1
+        }
+        val tailEnd = (endExclusive + 3).coerceAtMost(textLower.length)
+        val decimalTailLength = moneyDecimalTailPattern
+            .find(textLower.substring(endExclusive, tailEnd))
+            ?.value
+            ?.length ?: 0
+        val afterStart = endExclusive + decimalTailLength
+        var windowEnd = (afterStart + MONEY_CONTEXT_AFTER).coerceAtMost(textLower.length)
+        val nextBreak = textLower.indexOfAny(MONEY_CONTEXT_BREAKS, afterStart)
+        if (nextBreak in afterStart until windowEnd) {
+            windowEnd = nextBreak
+        }
         val context = textLower.substring(windowStart, windowEnd)
         return parserDictionary.moneyContextPattern.containsMatchIn(context)
     }
@@ -5090,7 +5189,8 @@ object LiveUpdateNotifier {
 
     private data class OtpMatch(
         val code: String,
-        val aggregateKey: String
+        val aggregateKey: String,
+        val prefix: String? = null
     )
 
     private data class OtpCandidate(
